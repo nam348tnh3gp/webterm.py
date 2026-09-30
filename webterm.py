@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-webterm.py v11 - Terminal + màn hình ảo (noVNC) cho Termux.
+webterm.py v12 - Terminal + màn hình ảo (noVNC) cho Termux.
 
-BẢN FULL UI (FIXED) + NHIỀU GIAO DIỆN:
-  * Dùng noVNC vnc.html (full) thay vì vnc_lite.html → có Settings panel.
-  * FIX: path phải có '/' đầu: path=/novnc/ws/<token>
-  * ~35 theme: Dracula, Nord, Gruvbox, Catppuccin (4), Tokyo Night, Solarized,
-    One Dark, Monokai, Material, Ayu, Night Owl, Cobalt2, Rosé Pine (2)…
-  * Nút ⚙ noVNC mở full UI trong tab mới.
-  * Thêm tham số URL: quality/compression/view_only/shared/clipboard/bell…
+THAY ĐỔI v12:
+  * BỎ TOKEN hoàn toàn → URL rút gọn: http://localhost:8080/
+  * Hỗ trợ bind 0.0.0.0 (--host 0.0.0.0 hoặc --lan), tự in URL LAN.
+  * Vẫn kiểm tra Host header (chống DNS rebinding) khi mở LAN.
+  * Cảnh báo bảo mật khi mở LAN (không còn token).
 
 Chạy:
     python webterm.py --vnc
-    python webterm.py --vnc --display 1080x1920   # dọc cho điện thoại
-    python webterm.py --vnc --host 0.0.0.0 --lan
+    python webterm.py --vnc --host 0.0.0.0
+    python webterm.py --vnc --lan
 """
 
 import argparse
@@ -26,9 +24,9 @@ import json
 import os
 import pty
 import re
-import secrets
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -41,14 +39,12 @@ from urllib.parse import parse_qs, urlparse
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 CONF_DIR = os.path.expanduser("~/.config/webterm")
 SAVED_BG = os.path.join(CONF_DIR, "bg")
-TOKEN_FILE = os.path.join(CONF_DIR, "token")
 SCROLLBACK = 256 * 1024
 MAX_SESSIONS = 16
 MAX_UPLOAD = 25 * 1024 * 1024
 MAX_FRAME = 4 * 1024 * 1024
 VNC_LOG = "/tmp/webterm-vnc.log"
 
-TOKEN = ""
 CFG = {
     "image": None, "port": 8080, "shell": None, "font": 14,
     "dim": 0.55, "blur": 0, "virtual": None,
@@ -60,7 +56,7 @@ CFG = {
         "depth": 24,
         "vnc_port": 5900,
         "wm": "auto",
-        "resize_mode": "scale",   # "scale" | "off"
+        "resize_mode": "scale",
     }
 }
 SESSIONS = {}
@@ -140,7 +136,6 @@ class VirtualDisplay:
         return self.wm_proc is not None and self.wm_proc.poll() is None
 
     def _test_vnc_banner(self, timeout=3.0):
-        import socket
         t0 = time.time()
         while time.time() - t0 < timeout:
             try:
@@ -445,6 +440,7 @@ def ensure_novnc():
 # ---------------------------------------------------------------- Host check ---
 
 def host_allowed(host, allow_lan):
+    """Kiểm tra Host header để chống DNS rebinding."""
     if not host:
         return False
     h = host.strip()
@@ -454,6 +450,9 @@ def host_allowed(host, allow_lan):
         h = h[1:end]
     else:
         h = h.rsplit(":", 1)[0]
+    # Hostname không có dấu chấm → coi là tên máy nội bộ
+    if "." not in h and ":" not in h:
+        return True
     if h in ("127.0.0.1", "localhost", "::1"):
         return True
     if allow_lan:
@@ -741,6 +740,7 @@ async def handle(r, w):
         origin = hdr.get("origin")
         is_ws = hdr.get("upgrade", "").lower() == "websocket"
 
+        # Chống DNS rebinding dựa trên Host header
         if not host_allowed(host, CFG["allow_lan"]):
             VDISPLAY._log("http", f"403 Bad host={host!r} from {peer}")
             return respond(w, 403, f"Bad host: {host}")
@@ -752,18 +752,11 @@ async def handle(r, w):
             except Exception:
                 pass
 
-        # WebSocket VNC bridge
+        # WebSocket VNC bridge (không còn token)
         if is_ws and (url.path == "/novnc/ws" or url.path.startswith("/novnc/ws/")):
-            token_path = url.path[len("/novnc/ws"):].lstrip("/")
-            token_query = q.get("k", [""])[0]
-            ok = (token_path and secrets.compare_digest(token_path, TOKEN)) or \
-                 (token_query and secrets.compare_digest(token_query, TOKEN))
-            if not ok:
-                VDISPLAY._log("http", f"403 Bad ws token path={token_path!r} query={token_query!r} from {peer}")
-                return respond(w, 403, "Forbidden: bad ws token")
             return await ws_proxy_to_vnc(r, w, hdr)
 
-        # File tĩnh noVNC (không cần token)
+        # File tĩnh noVNC
         if url.path == "/novnc" or url.path.startswith("/novnc/"):
             if not novnc_ready():
                 ensure_novnc()
@@ -793,11 +786,6 @@ async def handle(r, w):
             cache = "no-store" if fp.endswith(".html") else "public, max-age=3600"
             return respond(w, 200, data, mime_of(fp), cache=cache)
 
-        # Token query từ đây
-        if not secrets.compare_digest(q.get("k", [""])[0], TOKEN):
-            VDISPLAY._log("http", f"403 Bad query token from {peer} path={url.path}")
-            return respond(w, 403, "Forbidden")
-
         # Terminal WebSocket
         if is_ws and url.path == "/ws":
             resp = ws_handshake_response(hdr)
@@ -821,7 +809,7 @@ async def handle(r, w):
             force = {}
             if CFG["virtual"]:
                 force = {"virt": True, "vcols": CFG["virtual"][0], "vrows": CFG["virtual"][1]}
-            html = (INDEX_HTML.replace("__TOKEN__", TOKEN)
+            html = (INDEX_HTML
                     .replace("__DEFAULTS__", defaults)
                     .replace("__FORCE__", json.dumps(force)))
             return respond(w, 200, html, "text/html; charset=utf-8")
@@ -865,7 +853,7 @@ async def handle(r, w):
             ok = VDISPLAY.resize(ww, hh, depth)
             return respond(w, 200 if ok else 500, "ok" if ok else "fail")
 
-        # Cấu hình runtime (WM, resize_mode)
+        # Cấu hình runtime
         if url.path == "/vnc/config" and method == "GET":
             wm = q.get("wm", [None])[0]
             if wm:
@@ -1239,7 +1227,7 @@ INDEX_HTML = r"""<!doctype html>
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.js"></script>
 <script>
-const K = "__TOKEN__", DEF = __DEFAULTS__, FORCE = __FORCE__;
+const DEF = __DEFAULTS__, FORCE = __FORCE__;
 const $ = s => document.querySelector(s);
 let cfg = Object.assign({}, DEF, JSON.parse(localStorage.getItem('wt_cfg') || '{}'), FORCE);
 (function(){
@@ -1286,7 +1274,7 @@ const THEMES = {
 const theme = () => Object.assign({ background: 'rgba(0,0,0,0)' }, THEMES[cfg.theme] || {});
 let tabs = [], active = null, ctrl = false, vncTab = null;
 
-function setBg() { $('#bg').style.backgroundImage = 'url("/bg?k=' + K + '&v=' + Date.now() + '")'; }
+function setBg() { $('#bg').style.backgroundImage = 'url("/bg?v=' + Date.now() + '")'; }
 function applyCfg() {
   localStorage.setItem('wt_cfg', JSON.stringify(cfg));
   document.documentElement.style.setProperty('--dim', cfg.dim);
@@ -1361,7 +1349,7 @@ function removeTab(t, kill) {
 }
 function connect(t) {
   if (t.gone) return;
-  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws?k=' + K);
+  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
   ws.binaryType = 'arraybuffer'; t.ws = ws;
   ws.onopen = () => { t.retry = 0; if (t === active) status(''); ws.send(JSON.stringify({ t: 'attach', id: t.id, c: t.term.cols, r: t.term.rows })); };
   ws.onmessage = e => {
@@ -1387,11 +1375,10 @@ function addTab(id) {
   tabs.push(t); select(t); connect(t); return t;
 }
 
-// ─── FIX: path PHẢI có '/' đầu. vnc.html (full) không tự thêm '/' như vnc_lite.html.
 function buildVncUrl() {
   const resizeMode = (cfg.vnc_resize === 'off') ? 'off' : 'scale';
   const p = new URLSearchParams({
-    path: '/novnc/ws/' + K,          // <-- FIX: có '/' đầu, token không encode
+    path: '/novnc/ws',
     autoconnect: '1',
     reconnect: '1',
     reconnect_delay: '2000',
@@ -1430,26 +1417,25 @@ function openVncFull() {
 }
 
 async function vncStart() {
-  await fetch('/vnc/config?k=' + K
-              + '&wm=' + encodeURIComponent(cfg.vnc_wm || 'auto')
+  await fetch('/vnc/config?wm=' + encodeURIComponent(cfg.vnc_wm || 'auto')
               + '&resize=' + encodeURIComponent(cfg.vnc_resize || 'scale'));
   status('đang tải noVNC…');
-  const r = await fetch('/vnc/start?k=' + K);
+  const r = await fetch('/vnc/start');
   if (r.ok) { status('Màn hình ảo đã khởi động'); addVncTab(); }
-  else status('Lỗi khởi động — xem /vnc/status?k=' + K);
+  else status('Lỗi khởi động — xem /vnc/status');
 }
 async function vncStop() {
-  await fetch('/vnc/stop?k=' + K);
+  await fetch('/vnc/stop');
   status('Đã dừng màn hình ảo');
   if (vncTab) removeTab(vncTab, false);
 }
 async function wmStart() {
-  await fetch('/vnc/config?k=' + K + '&wm=' + encodeURIComponent(cfg.vnc_wm || 'auto'));
-  const r = await fetch('/vnc/wm/start?k=' + K);
+  await fetch('/vnc/config?wm=' + encodeURIComponent(cfg.vnc_wm || 'auto'));
+  const r = await fetch('/vnc/wm/start');
   status(r.ok ? 'Desktop đã chạy' : 'Không chạy được desktop');
 }
 async function wmStop() {
-  await fetch('/vnc/wm/stop?k=' + K);
+  await fetch('/vnc/wm/stop');
   status('Đã dừng desktop');
 }
 async function applyResolution(ww, hh, d) {
@@ -1457,7 +1443,7 @@ async function applyResolution(ww, hh, d) {
   hh = Math.max(200, Math.min(2160, Math.round(hh)));
   d = d || cfg.vnc_depth || 24;
   status('đang restart Xvfb ' + ww + '×' + hh + '…');
-  const url = '/vnc/resize?k=' + K + '&w=' + ww + '&h=' + hh + '&d=' + d;
+  const url = '/vnc/resize?w=' + ww + '&h=' + hh + '&d=' + d;
   const r = await fetch(url);
   if (r.ok) {
     cfg._vw = ww; cfg._vh = hh;
@@ -1532,14 +1518,14 @@ $('#f_vmode').onchange = e => { cfg.vfit = e.target.value === 'fit'; applyCfg();
 $('#f_wake').onchange = e => { cfg.wake = e.target.checked; applyCfg(); setWake(cfg.wake); };
 $('#full').onclick = () => { if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen().catch(() => {}); };
 $('#f_vnc_wm').onchange = e => { cfg.vnc_wm = e.target.value; localStorage.setItem('wt_cfg', JSON.stringify(cfg));
-  fetch('/vnc/config?k=' + K + '&wm=' + encodeURIComponent(cfg.vnc_wm)); };
+  fetch('/vnc/config?wm=' + encodeURIComponent(cfg.vnc_wm)); };
 $('#f_vw').onchange = e => { cfg._vw = +e.target.value || 1280; localStorage.setItem('wt_cfg', JSON.stringify(cfg)); };
 $('#f_vh').onchange = e => { cfg._vh = +e.target.value || 720; localStorage.setItem('wt_cfg', JSON.stringify(cfg)); };
 $('#f_vnc_depth').onchange = e => { cfg.vnc_depth = +e.target.value || 24; localStorage.setItem('wt_cfg', JSON.stringify(cfg)); };
 $('#f_vnc_resize').onchange = e => {
   cfg.vnc_resize = e.target.value;
   localStorage.setItem('wt_cfg', JSON.stringify(cfg));
-  fetch('/vnc/config?k=' + K + '&resize=' + encodeURIComponent(cfg.vnc_resize));
+  fetch('/vnc/config?resize=' + encodeURIComponent(cfg.vnc_resize));
   if (vncTab) reloadVncTab();
 };
 $('#f_vnc_quality').onchange = e => {
@@ -1577,7 +1563,7 @@ $('#reset').onclick = () => { cfg = Object.assign({}, DEF); applyCfg(); fillPane
 $('#pick').onclick = () => $('#file').click();
 $('#file').onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
-  const r = await fetch('/bg?k=' + K, { method: 'POST', body: f });
+  const r = await fetch('/bg', { method: 'POST', body: f });
   if (r.ok) setBg(); else alert('Không tải được ảnh (' + r.status + ')');
   e.target.value = '';
 };
@@ -1600,6 +1586,18 @@ if (saved.length) saved.forEach(addTab); else addTab(null);
 
 # --------------------------------------------------------------------- main ---
 
+def lan_ip():
+    """Lấy IP LAN chính (không cần internet)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return None
+
+
 async def amain():
     server = await asyncio.start_server(handle, CFG["host"], CFG["port"])
     stop = asyncio.Event()
@@ -1607,25 +1605,32 @@ async def amain():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
-    display_host = CFG["host"]
-    if display_host == "0.0.0.0":
-        import socket
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80)); display_host = s.getsockname()[0]; s.close()
-        except Exception:
-            display_host = "127.0.0.1"
-    url = "http://%s:%d/?k=%s" % (display_host, CFG["port"], TOKEN)
     print("✅ Web terminal đang chạy")
-    print("🌐 Mở:", url)
+    if CFG["host"] == "0.0.0.0":
+        ip = lan_ip()
+        print(f"🌐 LAN  : http://{ip}:{CFG['port']}/" if ip else "🌐 LAN  : (không xác định IP)")
+        print(f"🌐 Local: http://127.0.0.1:{CFG['port']}/")
+    else:
+        print(f"🌐 Mở   : http://{CFG['host']}:{CFG['port']}/")
     print(f"   bind={CFG['host']} allow_lan={CFG['allow_lan']}")
+    if CFG["allow_lan"]:
+        print("⚠️  KHÔNG có token — bất kỳ ai trong LAN đều dùng được. Chỉ mở khi tin mạng.")
     if CFG["vnc"]["enabled"]:
         ensure_novnc()
         print(f"🖥️  Màn hình ảo (Xvfb {CFG['vnc']['geometry']}, WM {CFG['vnc']['wm']}, viewer={pick_viewer()})")
     print("   (Ctrl+C để dừng)")
-    if shutil.which("termux-open-url"):
-        subprocess.Popen(["termux-open-url", url],
+
+    open_url = None
+    if CFG["host"] == "0.0.0.0":
+        ip = lan_ip()
+        open_url = f"http://{ip}:{CFG['port']}/" if ip else None
+    else:
+        open_url = f"http://{CFG['host']}:{CFG['port']}/"
+
+    if open_url and shutil.which("termux-open-url"):
+        subprocess.Popen(["termux-open-url", open_url],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     if CFG["vnc"]["enabled"]:
         VDISPLAY.start()
 
@@ -1637,17 +1642,17 @@ async def amain():
 
 
 def main():
-    global TOKEN
-    ap = argparse.ArgumentParser(description="Web terminal + màn hình ảo cho Termux")
+    ap = argparse.ArgumentParser(description="Web terminal + màn hình ảo cho Termux (no token)")
     ap.add_argument("image", nargs="?", help="ảnh nền")
     ap.add_argument("--dim", type=float, default=CFG["dim"])
     ap.add_argument("--blur", type=int, default=CFG["blur"])
     ap.add_argument("--font", type=int, default=CFG["font"])
     ap.add_argument("--port", type=int, default=CFG["port"])
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--lan", action="store_true")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="địa chỉ bind: 127.0.0.1 (mặc định) hoặc 0.0.0.0")
+    ap.add_argument("--lan", action="store_true",
+                    help="cho phép truy cập từ LAN (tự bật khi --host 0.0.0.0)")
     ap.add_argument("--shell", help="shell muốn chạy")
-    ap.add_argument("--stable", action="store_true")
     ap.add_argument("--virtual", metavar="CỘTxHÀNG")
     ap.add_argument("--display", metavar="WxH", default="1280x720")
     ap.add_argument("--depth", type=int, default=24)
@@ -1678,24 +1683,14 @@ def main():
     elif os.path.isfile(SAVED_BG):
         CFG["image"] = SAVED_BG
 
-    if a.stable:
-        os.makedirs(CONF_DIR, exist_ok=True)
-        if os.path.isfile(TOKEN_FILE):
-            TOKEN = open(TOKEN_FILE).read().strip()
-        if not TOKEN:
-            TOKEN = secrets.token_urlsafe(16)
-            fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write(TOKEN)
-    else:
-        TOKEN = secrets.token_urlsafe(16)
-
     VDISPLAY.wm_name = CFG["vnc"]["wm"]
 
     try:
         asyncio.run(amain())
     except OSError as e:
-        print("❌ Không mở được %s:%d: %s" % (CFG["host"], CFG["port"], e))
+        print(f"❌ Không mở được {CFG['host']}:{CFG['port']}: {e}")
+        if "address already in use" in str(e).lower():
+            print(f"   Thử cổng khác: --port {CFG['port'] + 1}")
         sys.exit(1)
 
 
