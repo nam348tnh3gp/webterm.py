@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-webterm.py v12 - Terminal + màn hình ảo (noVNC) cho Termux.
+webterm.py v13 - Terminal + màn hình ảo (noVNC) cho Termux / Render.com.
 
-THAY ĐỔI v12:
-  * BỎ TOKEN hoàn toàn → URL rút gọn: http://localhost:8080/
-  * Hỗ trợ bind 0.0.0.0 (--host 0.0.0.0 hoặc --lan), tự in URL LAN.
-  * Vẫn kiểm tra Host header (chống DNS rebinding) khi mở LAN.
-  * Cảnh báo bảo mật khi mở LAN (không còn token).
+THAY ĐỔI v13:
+  * FIX "Bad host" trên Render / PaaS / custom domain.
+  * Tự nhận môi trường PaaS: $PORT, $RENDER, $RENDER_EXTERNAL_URL.
+  * allow_lan=True → chấp nhận mọi Host header (đã opt-in).
+  * Origin check không phân biệt port/case.
+  * Ẩn nút VNC nếu thiếu Xvfb (Render không có X server).
+  * URL rút gọn không token: http://localhost:8080/
 
 Chạy:
-    python webterm.py --vnc
-    python webterm.py --vnc --host 0.0.0.0
-    python webterm.py --vnc --lan
+    python webterm.py --vnc                         # Termux mặc định
+    python webterm.py --vnc --host 0.0.0.0 --lan    # LAN
+    python webterm.py                               # Render (auto-detect)
 """
 
 import argparse
@@ -63,6 +65,18 @@ SESSIONS = {}
 WM_CANDIDATES = ["startxfce4", "xfce4-session", "startlxde", "lxsession",
                  "startlxqt", "startplasma-x11", "mate-session",
                  "openbox-session", "fluxbox", "icewm-session", "i3"]
+
+
+def vnc_binary_available():
+    """Xvfb có sẵn hay không (Termux có, Render mặc định không)."""
+    for p in ("Xvfb",):
+        if shutil.which(p):
+            return True
+        for cand in (f"/data/data/com.termux/files/usr/bin/{p}",
+                     f"/usr/bin/{p}", f"/usr/local/bin/{p}"):
+            if os.path.exists(cand):
+                return True
+    return False
 
 
 # ----------------------------------------------------- Virtual Display (VNC) ---
@@ -330,6 +344,7 @@ class VirtualDisplay:
             "resize_mode": CFG["vnc"]["resize_mode"],
             "novnc_installed": novnc_ready(),
             "novnc_viewer": pick_viewer(),
+            "vnc_binary_available": vnc_binary_available(),
             "bind_host": CFG["host"], "allow_lan": CFG["allow_lan"],
             "last_error": self.last_error, "log_tail": tail,
         }
@@ -440,35 +455,42 @@ def ensure_novnc():
 # ---------------------------------------------------------------- Host check ---
 
 def host_allowed(host, allow_lan):
-    """Kiểm tra Host header để chống DNS rebinding."""
+    """Chống DNS rebinding.
+    - allow_lan=False → chỉ localhost (127.0.0.1/localhost/::1, hostname 1 nhãn).
+    - allow_lan=True  → chấp nhận mọi Host (Render, ngrok, LAN, custom domain…).
+    """
     if not host:
         return False
+    if allow_lan:
+        return True
     h = host.strip()
-    if h.startswith("["):
+    if h.startswith("["):                 # IPv6 [::1]:8080
         end = h.find("]")
-        if end < 0: return False
+        if end < 0:
+            return False
         h = h[1:end]
     else:
         h = h.rsplit(":", 1)[0]
-    # Hostname không có dấu chấm → coi là tên máy nội bộ
-    if "." not in h and ":" not in h:
+    if "." not in h and ":" not in h:     # "localhost", "termux"
         return True
-    if h in ("127.0.0.1", "localhost", "::1"):
+    return h in ("127.0.0.1", "localhost", "::1")
+
+
+def netloc_matches(origin_netloc, host_header):
+    """So sánh netloc lỏng: không phân biệt hoa/thường, port tùy chọn."""
+    if not origin_netloc or not host_header:
+        return False
+    a = origin_netloc.lower()
+    b = host_header.lower()
+    if a == b:
         return True
-    if allow_lan:
-        try:
-            o = [int(p) for p in h.split(".")]
-            if len(o) == 4:
-                if o[0] == 10: return True
-                if o[0] == 172 and 16 <= o[1] <= 31: return True
-                if o[0] == 192 and o[1] == 168: return True
-                if o[0] == 169 and o[1] == 254: return True
-                if o[0] == 127: return True
-        except (ValueError, IndexError):
-            pass
-        if h.startswith(("fc", "fd", "fe8", "fe9", "fea", "feb")):
-            return True
-    return False
+    # Bỏ port ở cả hai (giữ lại hostname)
+    def strip_port(s):
+        if s.startswith("["):             # [::1]:8080
+            end = s.find("]")
+            return s[: end + 1] if end >= 0 else s
+        return s.rsplit(":", 1)[0]
+    return strip_port(a) == strip_port(b)
 
 
 # ---------------------------------------------------------------- WebSocket ---
@@ -740,19 +762,20 @@ async def handle(r, w):
         origin = hdr.get("origin")
         is_ws = hdr.get("upgrade", "").lower() == "websocket"
 
-        # Chống DNS rebinding dựa trên Host header
         if not host_allowed(host, CFG["allow_lan"]):
             VDISPLAY._log("http", f"403 Bad host={host!r} from {peer}")
             return respond(w, 403, f"Bad host: {host}")
+
         if origin:
             try:
-                if urlparse(origin).netloc != host:
+                onetloc = urlparse(origin).netloc
+                if not netloc_matches(onetloc, host):
                     VDISPLAY._log("http", f"403 Bad origin={origin!r} host={host!r}")
                     return respond(w, 403, "Bad origin")
             except Exception:
                 pass
 
-        # WebSocket VNC bridge (không còn token)
+        # WebSocket VNC bridge
         if is_ws and (url.path == "/novnc/ws" or url.path.startswith("/novnc/ws/")):
             return await ws_proxy_to_vnc(r, w, hdr)
 
@@ -801,6 +824,7 @@ async def handle(r, w):
                 "theme": "default", "fit": "cover", "wake": False,
                 "virt": False, "vcols": 120, "vrows": 40, "vfit": True,
                 "vnc_enabled": CFG["vnc"]["enabled"],
+                "vnc_available": vnc_binary_available(),
                 "vnc_geom": CFG["vnc"]["geometry"],
                 "vnc_depth": CFG["vnc"]["depth"],
                 "vnc_wm": CFG["vnc"]["wm"],
@@ -868,6 +892,8 @@ async def handle(r, w):
 
         # Start/stop
         if url.path == "/vnc/start" and method == "GET":
+            if not vnc_binary_available():
+                return respond(w, 503, "Xvfb không có trên hệ thống này (Render/container?)")
             ensure_novnc()
             ok = VDISPLAY.start()
             return respond(w, 200 if ok else 500, "ok" if ok else "fail")
@@ -924,6 +950,18 @@ async def ws_proxy_to_vnc(r, w, hdr):
         await w.drain()
     except Exception as e:
         VDISPLAY._log("bridge", f"drain failed: {e}")
+        try: w.close()
+        except Exception: pass
+        return
+
+    if not vnc_binary_available():
+        err = "Xvfb/x11vnc không có trên máy chủ này — không thể mở màn hình ảo."
+        VDISPLAY._log("bridge", err)
+        try:
+            w.write(frame(1, err.encode("utf-8")))
+            w.write(frame(8, b"")); await w.drain()
+        except Exception:
+            pass
         try: w.close()
         except Exception: pass
         return
@@ -1174,6 +1212,7 @@ INDEX_HTML = r"""<!doctype html>
   <label><span>Hiển thị tab</span><select id="f_vmode">
     <option value="fit">Thu nhỏ vừa màn hình</option><option value="scroll">Giữ cỡ chữ, kéo để xem</option></select></label>
   <hr style="border-color:#444; margin:12px 0">
+  <div id="vnc-section">
   <div style="font-weight:bold;margin-bottom:6px">🖥️ Màn hình ảo (Xvfb + x11vnc + desktop)</div>
   <div id="hint">Resize = restart Xvfb (mọi app GUI sẽ đóng). Sau khi resize, noVNC tự kết nối lại sau ~2 giây.</div>
   <label><span>Desktop (WM)</span><select id="f_vnc_wm">
@@ -1218,6 +1257,7 @@ INDEX_HTML = r"""<!doctype html>
     <button id="wm-stop">Chỉ dừng desktop</button>
     <button id="vnc-reload">↻ Tải lại VNC tab</button>
     <button id="vnc-open-full">⚙ Mở noVNC full (tab mới)</button>
+  </div>
   </div>
   <div class="row"><button id="pick">Đổi ảnh nền…</button><button id="full">Toàn màn hình</button>
     <button id="reset">Đặt lại</button><button id="close">Đóng</button></div>
@@ -1576,6 +1616,15 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
+// Ẩn nút VNC nếu môi trường không có Xvfb (Render, PaaS…)
+if (!DEF.vnc_available) {
+  const vb = $('#vnc-btn'), vf = $('#vnc-full');
+  if (vb) vb.style.display = 'none';
+  if (vf) vf.style.display = 'none';
+  const vs = $('#vnc-section');
+  if (vs) vs.style.display = 'none';
+}
+
 setBg(); applyCfg(); if (cfg.wake) setWake(true);
 const saved = JSON.parse(localStorage.getItem('wt_ids') || '[]');
 if (saved.length) saved.forEach(addTab); else addTab(null);
@@ -1585,6 +1634,16 @@ if (saved.length) saved.forEach(addTab); else addTab(null);
 
 
 # --------------------------------------------------------------------- main ---
+
+def detect_paas():
+    """Phát hiện Render/Heroku/Fly/Railway… qua biến môi trường.
+    Trả về (is_paas, external_url_or_None)."""
+    is_paas = any(os.environ.get(k) for k in
+                   ("RENDER", "RENDER_EXTERNAL_URL", "DYNO",
+                    "FLY_APP_NAME", "RAILWAY_ENVIRONMENT"))
+    ext = os.environ.get("RENDER_EXTERNAL_URL") or None
+    return is_paas, ext
+
 
 def lan_ip():
     """Lấy IP LAN chính (không cần internet)."""
@@ -1605,23 +1664,38 @@ async def amain():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
+    is_paas, ext_url = detect_paas()
+
     print("✅ Web terminal đang chạy")
-    if CFG["host"] == "0.0.0.0":
+    if is_paas and ext_url:
+        print(f"🌐 Public: {ext_url}")
+        print(f"🌐 Local : http://127.0.0.1:{CFG['port']}/")
+    elif CFG["host"] == "0.0.0.0":
         ip = lan_ip()
         print(f"🌐 LAN  : http://{ip}:{CFG['port']}/" if ip else "🌐 LAN  : (không xác định IP)")
         print(f"🌐 Local: http://127.0.0.1:{CFG['port']}/")
     else:
         print(f"🌐 Mở   : http://{CFG['host']}:{CFG['port']}/")
-    print(f"   bind={CFG['host']} allow_lan={CFG['allow_lan']}")
+    print(f"   bind={CFG['host']} allow_lan={CFG['allow_lan']} paas={is_paas}")
     if CFG["allow_lan"]:
-        print("⚠️  KHÔNG có token — bất kỳ ai trong LAN đều dùng được. Chỉ mở khi tin mạng.")
+        if is_paas and ext_url:
+            print("⚠️  URL PUBLIC, KHÔNG có token — bất kỳ ai có link đều dùng được shell.")
+            print("    → Chỉ dùng cho demo. Production: thêm auth (Basic/Token) hoặc Private Service.")
+        else:
+            print("⚠️  KHÔNG có token — bất kỳ ai trong LAN đều dùng được. Chỉ mở khi tin mạng.")
     if CFG["vnc"]["enabled"]:
-        ensure_novnc()
-        print(f"🖥️  Màn hình ảo (Xvfb {CFG['vnc']['geometry']}, WM {CFG['vnc']['wm']}, viewer={pick_viewer()})")
+        if vnc_binary_available():
+            ensure_novnc()
+            print(f"🖥️  Màn hình ảo (Xvfb {CFG['vnc']['geometry']}, WM {CFG['vnc']['wm']}, viewer={pick_viewer()})")
+        else:
+            print("ℹ️  Không có Xvfb — bỏ qua màn hình ảo (chỉ dùng terminal).")
     print("   (Ctrl+C để dừng)")
 
+    # Tự mở URL bằng termux-open-url (chỉ trên Termux có binary này)
     open_url = None
-    if CFG["host"] == "0.0.0.0":
+    if is_paas and ext_url:
+        open_url = ext_url
+    elif CFG["host"] == "0.0.0.0":
         ip = lan_ip()
         open_url = f"http://{ip}:{CFG['port']}/" if ip else None
     else:
@@ -1631,7 +1705,7 @@ async def amain():
         subprocess.Popen(["termux-open-url", open_url],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    if CFG["vnc"]["enabled"]:
+    if CFG["vnc"]["enabled"] and vnc_binary_available():
         VDISPLAY.start()
 
     await stop.wait()
@@ -1642,7 +1716,7 @@ async def amain():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Web terminal + màn hình ảo cho Termux (no token)")
+    ap = argparse.ArgumentParser(description="Web terminal + màn hình ảo cho Termux / Render")
     ap.add_argument("image", nargs="?", help="ảnh nền")
     ap.add_argument("--dim", type=float, default=CFG["dim"])
     ap.add_argument("--blur", type=int, default=CFG["blur"])
@@ -1651,7 +1725,7 @@ def main():
     ap.add_argument("--host", default="127.0.0.1",
                     help="địa chỉ bind: 127.0.0.1 (mặc định) hoặc 0.0.0.0")
     ap.add_argument("--lan", action="store_true",
-                    help="cho phép truy cập từ LAN (tự bật khi --host 0.0.0.0)")
+                    help="cho phép truy cập từ LAN/PaaS (tự bật khi --host 0.0.0.0)")
     ap.add_argument("--shell", help="shell muốn chạy")
     ap.add_argument("--virtual", metavar="CỘTxHÀNG")
     ap.add_argument("--display", metavar="WxH", default="1280x720")
@@ -1661,12 +1735,25 @@ def main():
     ap.add_argument("--no-wm", action="store_true")
     a = ap.parse_args()
 
+    # ---- Auto-detect PaaS (Render / Heroku / Fly / Railway) ----
+    is_paas, _ext_url = detect_paas()
+    port_env = os.environ.get("PORT")
+    if is_paas or port_env:
+        a.host = "0.0.0.0"
+        a.lan = True
+        if port_env:
+            try:
+                a.port = int(port_env)
+            except ValueError:
+                pass
+        print(f"☁️  Phát hiện PaaS: bind=0.0.0.0 port={a.port} lan=True")
+
     CFG.update(dim=max(0.0, min(1.0, a.dim)), blur=max(0, a.blur),
                font=a.font, port=a.port, shell=a.shell, host=a.host)
     CFG["allow_lan"] = a.lan or a.host == "0.0.0.0"
     CFG["vnc"]["geometry"] = a.display
     CFG["vnc"]["depth"] = a.depth
-    CFG["vnc"]["enabled"] = a.vnc
+    CFG["vnc"]["enabled"] = a.vnc and vnc_binary_available()
     CFG["vnc"]["wm"] = "none" if a.no_wm else a.wm
 
     if a.virtual:
