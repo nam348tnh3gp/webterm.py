@@ -9,11 +9,12 @@ RUN apk add --no-cache \
         curl \
         xvfb \
         x11vnc \
-        openbox \
+        icewm \
         xterm \
-        xfce4 \
         ttf-dejavu \
-        fontconfig
+        fontconfig \
+    # Dọn cache & file rác để giảm size image và RAM footprint
+    && rm -rf /var/cache/apk/* /tmp/* /var/tmp/*
 
 WORKDIR /app
 COPY webterm.py .
@@ -21,6 +22,6 @@ COPY webterm.py .
 ENV PYTHONUNBUFFERED=1
 
 # --vnc: bật Xvfb + x11vnc
-# --wm openbox: WM nhẹ, đủ để có desktop
+# --wm icewm: WM siêu nhẹ (~5-15MB RAM) thay cho xfce4 (~150-300MB)
 # Render tự inject $PORT → code tự bind 0.0.0.0 + allow_lan
-CMD ["python3", "webterm.py", "--vnc", "--wm", "openbox"]
+CMD ["python3", "webterm.py", "--vnc", "--wm", "icewm"]
