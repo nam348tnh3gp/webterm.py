@@ -1,6 +1,27 @@
 #!/usr/bin/env python3
 """
-webterm.py v23 - Terminal + màn hình ảo (noVNC) cho Termux / Render.com.
+webterm.py v27 - Terminal + màn hình ảo (noVNC) cho Termux / Render.com.
+
+THAY ĐỔI v27 (HIỆU NĂNG + UI/UX):
+  * Service worker /sw.js: cache thư viện xterm từ CDN -> mở trang nhanh hơn và dùng được khi offline
+    (từ lần mở thứ 2; cần HTTPS hoặc localhost). preconnect tới CDN.
+  * Menu ngữ cảnh: giữ lâu trên terminal -> Dán / Chép / Lệnh nhanh / Tìm / Xóa màn hình.
+  * Màn hình thấp (xoay ngang): thanh trên và thanh phím tự thu gọn để dành chỗ cho terminal.
+
+THAY ĐỔI v26 (HIỆU NĂNG + UI/UX):
+  * Keepalive ping/pong 20s: tránh proxy (Render, Cloudflare...) cắt kết nối khi để im.
+  * Bảng thống kê (Cài đặt > Hiệu năng > "Hiện thống kê"): RTT, tốc độ nhận, hàng đợi vẽ, trình vẽ.
+  * Gộp applyCfg theo khung hình: kéo thanh trượt không còn ghi localStorage/fit hàng chục lần mỗi giây.
+
+THAY ĐỔI v25 (HIỆU NĂNG - chống treo khi output quá lớn):
+  * Điều khiển luồng: trình duyệt báo "tạm dừng" khi hàng đợi vẽ > ~400KB và "tiếp tục" khi < ~100KB;
+    server ngừng đọc pty trong lúc đó (tiến trình tự chậm lại thay vì làm treo trang).
+  * Tab ẩn / app ở nền: tự tiếp tục để lệnh chạy lâu (build, tải) không bị đứng.
+
+THAY ĐỔI v24 (UI/UX):
+  * Giữ lâu một tab -> menu: Đổi tên / Đóng tab / Đóng các tab khác (chạm đúp vẫn đổi tên).
+  * Chặn kéo-xuống-để-tải-lại của Chrome (overscroll), hiện cỡ chữ khi chụm hai ngón.
+  * Bàn phím rời: Alt+Shift+T tab mới, W đóng, F tìm, ←/→ chuyển tab.
 
 THAY ĐỔI v23 (FIX):
   * Gõ exit: server gửi thêm khung đóng WebSocket (mã 1000, lý do "exit") và client coi đó là thoát shell
@@ -609,6 +630,7 @@ class Client:
     def __init__(self, w):
         self.w = w
         self.sess = None
+        self.paused = False
 
     def write(self, fr):
         if not self.w.is_closing():
@@ -695,6 +717,7 @@ class Session:
         self.pid, self.fd = pid, fd
         os.set_blocking(fd, False)
         self.resize(cols, rows)
+        self.reading = True
         asyncio.get_running_loop().add_reader(fd, self.on_read)
         SESSIONS[self.id] = self
 
@@ -725,6 +748,18 @@ class Session:
             return
         self.emit(data)
         self.hold = asyncio.get_running_loop().call_later(0.008, self.release)
+
+    def update_flow(self):
+        if self.dead:
+            return
+        want = not any(c.paused for c in self.clients)
+        loop = asyncio.get_running_loop()
+        if want and not self.reading:
+            loop.add_reader(self.fd, self.on_read)
+            self.reading = True
+        elif not want and self.reading:
+            loop.remove_reader(self.fd)
+            self.reading = False
 
     def emit(self, data):
         fr = frame(2, data)
@@ -797,6 +832,24 @@ class Session:
 REASONS = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found",
            413: "Payload Too Large", 415: "Unsupported Media Type",
            500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable"}
+
+
+SW_JS = """
+const C = 'wt-libs-v1';
+self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', e => {
+  const u = new URL(e.request.url);
+  if (e.request.method !== 'GET' || u.hostname !== 'cdn.jsdelivr.net') return;
+  e.respondWith(caches.open(C).then(async c => {
+    const hit = await c.match(e.request);
+    if (hit) return hit;
+    const r = await fetch(e.request);
+    if (r && (r.ok || r.type === 'opaque')) c.put(e.request, r.clone());
+    return r;
+  }));
+});
+"""
 
 
 def respond(w, code, body=b"", ctype="text/plain; charset=utf-8", cache="no-store"):
@@ -917,6 +970,9 @@ async def handle(r, w):
                     .replace("__DEFAULTS__", defaults)
                     .replace("__FORCE__", json.dumps(force)))
             return respond(w, 200, html, "text/html; charset=utf-8")
+
+        if url.path == "/sw.js" and method == "GET":
+            return respond(w, 200, SW_JS, "application/javascript; charset=utf-8", "no-cache")
 
         # Chẩn đoán
         if url.path == "/vnc/status" and method == "GET":
@@ -1147,6 +1203,8 @@ async def ws_session(r, w):
             except ValueError:
                 continue
             t = m.get("t"); s = cl.sess
+            if t == "ping":
+                cl.text({"t": "pong", "ts": m.get("ts")}); continue
             if t == "attach":
                 cols, rows = int(m.get("c") or 80), int(m.get("r") or 24)
                 sess = SESSIONS.get(m.get("id"))
@@ -1157,8 +1215,10 @@ async def ws_session(r, w):
                 else:
                     sess.resize(cols, rows)
                 sess.flush_pending()
-                if s: s.clients.discard(cl)
-                cl.sess = sess; sess.clients.add(cl)
+                if s:
+                    s.clients.discard(cl); s.update_flow()
+                cl.paused = False
+                cl.sess = sess; sess.clients.add(cl); sess.update_flow()
                 cl.text({"t": "attached", "id": sess.id})
                 if sess.buf: cl.write(frame(2, bytes(sess.buf)))
             elif s is None:
@@ -1167,12 +1227,17 @@ async def ws_session(r, w):
                 s.write(str(m.get("d", "")).encode("utf-8"))
             elif t == "r":
                 s.resize(int(m.get("c", 0)), int(m.get("r", 0)))
+            elif t == "p":
+                cl.paused = True; s.update_flow()
+            elif t == "c":
+                cl.paused = False; s.update_flow()
             elif t == "kill":
                 s.close(); break
     except (asyncio.IncompleteReadError, ConnectionError, ValueError, OSError):
         pass
     finally:
-        if cl.sess: cl.sess.clients.discard(cl)
+        if cl.sess:
+            cl.sess.clients.discard(cl); cl.sess.update_flow()
         w.close()
 
 
@@ -1183,6 +1248,7 @@ INDEX_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="theme-color" content="#0b0d12">
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -1305,6 +1371,24 @@ INDEX_HTML = r"""<!doctype html>
   .udot { width: 8px; height: 8px; border-radius: 50%; background: var(--acc); flex: none; }
   #panes.bell::before { content: ""; position: absolute; inset: 0; z-index: 2; pointer-events: none; border: 3px solid var(--acc); background: var(--acc-soft); animation: bellf .22s ease-out; }
   @keyframes bellf { from { opacity: 1; } to { opacity: 0; } }
+  html, body { overscroll-behavior: none; }
+  #tabmenu { position: fixed; z-index: 7; min-width: 176px; padding: 6px; display: flex; flex-direction: column; gap: 4px;
+             background: rgba(20,22,30,.98); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.5); animation: fadein .12s; }
+  #tabmenu button { height: 42px; text-align: left; padding: 0 12px; border: 0; background: transparent; }
+  #tabmenu button:active { background: rgba(255,255,255,.12); }
+  #tabmenu .danger { color: #f87171; }
+  body.busy #top { box-shadow: inset 0 -2px 0 var(--acc); animation: pulse 1.2s infinite; }
+  #hud { position: fixed; z-index: 6; right: 8px; top: calc(env(safe-area-inset-top) + 56px); padding: 4px 8px; border-radius: 8px;
+         font: 11px ui-monospace, Menlo, monospace; color: var(--mut); background: rgba(0,0,0,.6); pointer-events: none; }
+  #hud[hidden] { display: none; }
+  @media (max-height: 520px) {
+    #top, #bar { padding: 3px 6px; gap: 4px; }
+    .ib { width: 34px; height: 34px; font-size: 15px; }
+    .tab { height: 34px; }
+    #bar button { height: 34px; min-width: 38px; padding: 0 8px; }
+    .pane { padding: 2px 6px; }
+    #toast, #hud { top: calc(env(safe-area-inset-top) + 44px); }
+  }
   #hint { font-size: 12px; color: var(--mut); margin: 4px 0 8px; }
   @media (min-width: 700px) { #panel { border-radius: 18px; bottom: 16px; border-bottom: 1px solid var(--line); } }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
@@ -1320,6 +1404,7 @@ INDEX_HTML = r"""<!doctype html>
     <button id="cfg" class="ib" aria-label="Cài đặt" title="Cài đặt">☰</button>
   </div>
   <div id="toast" role="status" aria-live="polite"></div>
+  <div id="hud" hidden></div>
   <div id="findbar" hidden>
     <input id="fi" type="search" placeholder="Tìm trong terminal" autocomplete="off" autocapitalize="off" spellcheck="false">
     <button id="fprev" aria-label="Kết quả trước">↑</button><button id="fnext" aria-label="Kết quả sau">↓</button><button id="fclose" aria-label="Đóng tìm kiếm">×</button>
@@ -1412,6 +1497,7 @@ INDEX_HTML = r"""<!doctype html>
     <option value="bracket">Bracketed — an toàn cho vim/nano</option>
     <option value="raw">Thô — gửi từng đoạn nhỏ</option></select></label>
   <label><span>Rung phản hồi</span><input type="checkbox" id="f_haptic"></label>
+  <div style="font-size:12px;color:var(--mut);margin:6px 0 2px">Bàn phím rời: Alt+Shift+T tab mới · W đóng · F tìm · ←/→ chuyển tab. Giữ lâu một tab để mở menu.</div>
   <div class="sec-t">Kích thước terminal</div>
   <label><span>Màn hình ảo (tab)</span><input type="checkbox" id="f_virt"> cỡ cố định</label>
   <label><span>Cột × Hàng</span><input type="number" id="f_vc" min="20" max="500" style="width:72px"> × <input type="number" id="f_vr" min="5" max="300" style="width:72px"></label>
@@ -1470,6 +1556,7 @@ INDEX_HTML = r"""<!doctype html>
     <option value="webgl">WebGL (nhanh nhất)</option>
     <option value="dom">DOM (tương thích)</option></select></label>
   <label><span>Chế độ tiết kiệm</span><input type="checkbox" id="f_lite"></label>
+  <label><span>Hiện thống kê</span><input type="checkbox" id="f_hud"></label>
   <div id="hint">Tiết kiệm: tắt hiệu ứng mờ, animation và nháy con trỏ — nên bật khi máy yếu hoặc output dồn dập.</div>
   <div class="sec-t">Sao lưu</div>
   <div class="row"><button id="bk-exp">⬇ Xuất cấu hình</button><button id="bk-imp">⬆ Nhập cấu hình</button></div>
@@ -1532,7 +1619,9 @@ const theme = () => Object.assign({ background: 'rgba(0,0,0,0)' }, THEMES[cfg.th
 let tabs = [], active = null, ctrl = false, vncTab = null;
 
 function setBg() { $('#bg').style.backgroundImage = 'url("/bg?v=' + Date.now() + '")'; }
-function applyCfg() {
+let _cfgRaf = 0;
+function applyCfg() { if (_cfgRaf) return; _cfgRaf = requestAnimationFrame(() => { _cfgRaf = 0; applyCfgNow(); }); }
+function applyCfgNow() {
   localStorage.setItem('wt_cfg', JSON.stringify(cfg));
   document.body.classList.toggle('lite', !!cfg.lite);
   document.documentElement.style.setProperty('--dim', cfg.dim);
@@ -1602,13 +1691,12 @@ function renderTabs() {
       x.onclick = ev => { ev.stopPropagation(); removeTab(t, true); };
       b.appendChild(x);
     }
-    b.onclick = () => { if (t !== active) select(t); };
-    if (!t.isVnc) b.ondblclick = () => {
-      const nm = prompt('Tên tab (để trống = theo tiêu đề):', label); if (nm === null) return;
-      t.name = nm.trim().slice(0, 24) || null;
-      if (t.id != null) { if (t.name) NAMES[t.id] = t.name; else delete NAMES[t.id]; }
-      saveIds(); renderTabs();
-    };
+    let lp = null, fired = false;
+    b.addEventListener('pointerdown', () => { fired = false; lp = setTimeout(() => { fired = true; openTabMenu(t, b); }, 450); });
+    ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => b.addEventListener(ev, () => clearTimeout(lp)));
+    b.addEventListener('contextmenu', e => { e.preventDefault(); clearTimeout(lp); if (!fired) openTabMenu(t, b); fired = true; });
+    b.onclick = () => { if (fired) { fired = false; return; } if (t !== active) select(t); };
+    if (!t.isVnc) b.ondblclick = () => renameTab(t);
     box.appendChild(b);
     if (t === active) requestAnimationFrame(() => b.scrollIntoView({ inline: 'nearest', block: 'nearest' }));
   });
@@ -1647,9 +1735,17 @@ function connect(t) {
   ws.binaryType = 'arraybuffer'; t.ws = ws; connUpd();
   ws.onopen = () => { connUpd(); t.retry = 0; if (t === active) status(''); ws.send(JSON.stringify({ t: 'attach', id: t.id, c: t.term.cols, r: t.term.rows })); };
   ws.onmessage = e => {
-    if (typeof e.data !== 'string') { if (t !== active && !t.unread && Date.now() > (t.quietUntil || 0)) { t.unread = true; renderTabs(); } return t.term.write(new Uint8Array(e.data)); }
+    if (typeof e.data !== 'string') { if (t !== active && !t.unread && Date.now() > (t.quietUntil || 0)) { t.unread = true; renderTabs(); } const u8 = new Uint8Array(e.data); rxBytes += u8.length;
+      t.pend = (t.pend || 0) + u8.length;
+      if (!t.paused && t.pend > 400000 && !document.hidden) { t.paused = true; tx(t, { t: 'p' }); busyUpd(); }
+      return t.term.write(u8, () => {
+        t.pend = Math.max(0, t.pend - u8.length);
+        if (t.paused && t.pend < 100000) { t.paused = false; tx(t, { t: 'c' }); busyUpd(); }
+      });
+    }
     const m = JSON.parse(e.data);
-    if (m.t === 'attached') { t.quietUntil = Date.now() + 700; t.term.reset(); if (t.id !== m.id) { t.id = m.id; saveIds(); } }
+    if (m.t === 'pong') { rtt = Math.round(performance.now() - m.ts); return; }
+    if (m.t === 'attached') { t.paused = false; busyUpd(); t.pend = 0; t.quietUntil = Date.now() + 700; t.term.reset(); if (t.id !== m.id) { t.id = m.id; saveIds(); } }
     else if (m.t === 'exit') removeTab(t, false);
     else if (m.t === 'error') status(m.msg);
   };
@@ -1899,7 +1995,7 @@ async function setWake(on) {
 let pinch = 0;
 const dist = e => Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
 $('#panes').addEventListener('touchstart', e => { if (e.touches.length === 2) pinch = dist(e); }, { passive: true });
-$('#panes').addEventListener('touchmove', e => { if (e.touches.length !== 2 || !pinch) return; const d = dist(e), nf = Math.max(8, Math.min(28, Math.round(cfg.font * d / pinch))); if (nf !== cfg.font) { cfg.font = nf; pinch = d; applyCfg(); } }, { passive: true });
+$('#panes').addEventListener('touchmove', e => { if (e.touches.length !== 2 || !pinch) return; const d = dist(e), nf = Math.max(8, Math.min(28, Math.round(cfg.font * d / pinch))); if (nf !== cfg.font) { cfg.font = nf; pinch = d; applyCfg(); status('Cỡ chữ ' + nf); } }, { passive: true });
 $('#panes').addEventListener('touchend', () => { pinch = 0; }, { passive: true });
 $('#reset').onclick = () => { cfg = Object.assign({}, DEF); applyCfg(); fillPanel(); };
 $('#pick').onclick = () => $('#file').click();
@@ -1946,7 +2042,7 @@ document.querySelectorAll('#panel input[type=range]').forEach(r => {
 });
 $('#f_paste').onchange = e => { cfg.paste = e.target.value; applyCfg(); };
 const _fill = fillPanel;
-fillPanel = function () { _fill(); $('#f_render').value = cfg.render || 'canvas'; $('#f_lite').checked = !!cfg.lite; $('#f_lh').value = cfg.lh || 1; $('#f_cursor').value = cfg.cursor || 'block'; $('#f_haptic').checked = cfg.haptic !== false; window.syncThemes && syncThemes(); $('#f_paste').value = cfg.paste || 'auto'; document.querySelectorAll('#panel input[type=range]').forEach(r => r.up && r.up()); };
+fillPanel = function () { _fill(); $('#f_hud').checked = !!cfg.hud; $('#f_render').value = cfg.render || 'canvas'; $('#f_lite').checked = !!cfg.lite; $('#f_lh').value = cfg.lh || 1; $('#f_cursor').value = cfg.cursor || 'block'; $('#f_haptic').checked = cfg.haptic !== false; window.syncThemes && syncThemes(); $('#f_paste').value = cfg.paste || 'auto'; document.querySelectorAll('#panel input[type=range]').forEach(r => r.up && r.up()); };
 $('#backdrop').onclick = $('#grab').onclick = () => $('#close').click();
 document.addEventListener('keydown', e => { if (e.key !== 'Escape') return; if (!$('#snipbox').hidden) $('#snip-close').click(); else if (!$('#pastebox').hidden) closePaste(); else if (!$('#findbar').hidden) $('#fclose').click(); else if ($('#panel').classList.contains('open')) $('#close').click(); });
 $('#bar').addEventListener('click', e => { if (e.target.closest('button')) vib(6); });
@@ -2049,6 +2145,90 @@ $('#bar').addEventListener('click', e => { if (e.target.closest('button')) vib(6
     if (txt) navigator.clipboard.writeText(txt).then(() => status('Đã chép ' + txt.length + ' ký tự'), () => status('Đã chọn — bấm Chép để chép'));
   }, { passive: false });
 })();
+
+// ---- v27: service worker + menu ngữ cảnh ----
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+}
+function openCtxMenu(x, y) {
+  closeTabMenu();
+  const m = document.createElement('div'); m.id = 'tabmenu';
+  const add = (txt, fn) => { const b = document.createElement('button'); b.textContent = txt; b.onclick = () => { closeTabMenu(); fn(); }; m.appendChild(b); };
+  add('📋 Dán', () => $('#paste').click());
+  add('⎘ Chép', () => $('#copy').click());
+  add('⚡ Lệnh nhanh', () => $('#snip').click());
+  add('🔍 Tìm', () => $('#find').click());
+  add('⌫ Xóa màn hình', () => { if (active) tx(active, { t: 'i', d: '\x0c' }); });
+  document.body.appendChild(m);
+  m.style.left = Math.max(8, Math.min(innerWidth - m.offsetWidth - 8, x)) + 'px';
+  m.style.top = Math.max(8, Math.min(innerHeight - m.offsetHeight - 8, y + 8)) + 'px';
+  vib(10);
+}
+$('#panes').addEventListener('contextmenu', e => {
+  if (!active || !active.term || document.body.classList.contains('selmode') || e.target.closest('#jump')) return;
+  e.preventDefault(); openCtxMenu(e.clientX, e.clientY);
+});
+
+// ---- v26: keepalive + thống kê ----
+var rtt = null, rxBytes = 0, lastRx = 0, hudTimer = null;
+setInterval(() => { if (!document.hidden) tabs.forEach(t => tx(t, { t: 'ping', ts: performance.now() })); }, 20000);
+function hudTick() {
+  if (active) tx(active, { t: 'ping', ts: performance.now() });
+  const rate = (rxBytes - lastRx) / 2 / 1024; lastRx = rxBytes;
+  const pend = active && active.pend ? Math.round(active.pend / 1024) : 0;
+  $('#hud').textContent = 'RTT ' + (rtt == null ? '–' : rtt + ' ms') + ' · ↓ ' + rate.toFixed(1) + ' KB/s · chờ ' + pend + ' KB · ' + (cfg.render || 'canvas');
+}
+function hudSet() {
+  clearInterval(hudTimer); hudTimer = null;
+  $('#hud').hidden = !cfg.hud;
+  if (cfg.hud) { lastRx = rxBytes; hudTick(); hudTimer = setInterval(hudTick, 2000); }
+}
+$('#f_hud').onchange = e => { cfg.hud = e.target.checked; applyCfg(); hudSet(); };
+hudSet();
+
+// ---- v25: tab ẩn thì không giữ pause ----
+function busyUpd() { document.body.classList.toggle('busy', tabs.some(x => x.paused)); }
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) return;
+  tabs.forEach(t => { if (t.paused) { t.paused = false; tx(t, { t: 'c' }); } });
+  busyUpd();
+});
+
+// ---- v24: menu tab + phím tắt ----
+function renameTab(t) {
+  const cur = t.name || (t.id != null && NAMES[t.id]) || t.title || '';
+  const nm = prompt('Tên tab (để trống = theo tiêu đề):', cur); if (nm === null) return;
+  t.name = nm.trim().slice(0, 24) || null;
+  if (t.id != null) { if (t.name) NAMES[t.id] = t.name; else delete NAMES[t.id]; }
+  saveIds(); renderTabs();
+}
+function closeTabMenu() { const m = $('#tabmenu'); if (m) m.remove(); }
+function openTabMenu(t, anchor) {
+  closeTabMenu();
+  const m = document.createElement('div'); m.id = 'tabmenu';
+  const add = (txt, fn, danger) => { const b = document.createElement('button'); b.textContent = txt; if (danger) b.className = 'danger'; b.onclick = () => { closeTabMenu(); fn(); }; m.appendChild(b); };
+  if (!t.isVnc) add('✎ Đổi tên', () => renameTab(t));
+  add('✕ Đóng tab', () => removeTab(t, true), true);
+  if (tabs.length > 1) add('Đóng các tab khác', () => { select(t); tabs.filter(x => x !== t).forEach(x => removeTab(x, true)); }, true);
+  document.body.appendChild(m);
+  const r = anchor.getBoundingClientRect();
+  m.style.top = (r.bottom + 6) + 'px';
+  m.style.left = Math.max(8, Math.min(innerWidth - m.offsetWidth - 8, r.left)) + 'px';
+  vib(10);
+}
+document.addEventListener('pointerdown', e => { if (!e.target.closest('#tabmenu')) closeTabMenu(); }, true);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeTabMenu();
+  if (!(e.altKey && e.shiftKey) || e.ctrlKey || e.metaKey) return;
+  const i = tabs.indexOf(active); let used = true;
+  if (e.code === 'KeyT') $('#new').click();
+  else if (e.code === 'KeyW') { if (active) removeTab(active, true); }
+  else if (e.code === 'KeyF') $('#find').click();
+  else if (e.code === 'ArrowRight' || e.code === 'Period') { if (tabs.length) select(tabs[(i + 1) % tabs.length]); }
+  else if (e.code === 'ArrowLeft' || e.code === 'Comma') { if (tabs.length) select(tabs[(i - 1 + tabs.length) % tabs.length]); }
+  else used = false;
+  if (used) { e.preventDefault(); e.stopPropagation(); }
+}, true);
 
 // ---- v22: PWA ----
 (function () {
@@ -2175,7 +2355,7 @@ $('#f_haptic').onchange = e => { cfg.haptic = e.target.checked; applyCfg(); };
   box.addEventListener('click', e => { if (e.target === box) close(); });
 })();
 
-setBg(); applyCfg(); if (cfg.wake) setWake(true);
+setBg(); applyCfgNow(); if (cfg.wake) setWake(true);
 if ((cfg.render || 'canvas') === 'webgl') setRenderer();
 const saved = JSON.parse(localStorage.getItem('wt_ids') || '[]');
 if (saved.length) saved.forEach(addTab); else addTab(null);
