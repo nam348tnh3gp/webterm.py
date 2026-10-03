@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-webterm.py v27 - Terminal + màn hình ảo (noVNC) cho Termux / Render.com.
+webterm.py v28 - Terminal + màn hình ảo (noVNC) cho Termux / Render.com.
+
+THAY ĐỔI v28:
+  * Nâng noVNC lên v1.7.0. Thêm file marker .version trong NOVNC_DIR để buộc
+    tải lại khi đổi NOVNC_VERSION (máy đã cache 1.6.0 sẽ tự tải 1.7.0).
+  * Endpoint /vnc/novnc-check hiển thị expected_version + cached_version.
 
 THAY ĐỔI v27 (HIỆU NĂNG + UI/UX):
   * Service worker /sw.js: cache thư viện xterm từ CDN -> mở trang nhanh hơn và dùng được khi offline
@@ -61,7 +66,7 @@ THAY ĐỔI v16 (FIX DÁN CODE):
   * Dán giữ nguyên xuống dòng + thụt lề: hộp dán nhiều dòng (textarea) thay cho prompt()
     (prompt chỉ 1 dòng nên làm code dính thành 1 dòng). Giữ nút Dán lâu để mở hộp này.
   * Cài đặt "Chế độ dán": Tự động / Bracketed (an toàn cho vim, nano) / Thô (gửi từng đoạn).
-  * Chuẩn hoá \r\n, không cắt khoảng trắng đầu/cuối dòng.
+  * Chuẩn hoá \\r\\n, không cắt khoảng trắng đầu/cuối dòng.
 
 THAY ĐỔI v15 (UX):
   * Phím Alt, Ctrl giữ lâu = khóa; phím tắt ^C ^D ^Z ^L; nút ⌨ ẩn/hiện thanh phím.
@@ -414,6 +419,8 @@ class VirtualDisplay:
             "vnc_port": self.vnc_port,
             "vnc_port_listening": self._check_port(),
             "resize_mode": CFG["vnc"]["resize_mode"],
+            "novnc_version": NOVNC_VERSION,
+            "novnc_cached_version": novnc_cached_version(),
             "novnc_installed": novnc_ready(),
             "novnc_viewer": pick_viewer(),
             "vnc_binary_available": vnc_binary_available(),
@@ -427,9 +434,10 @@ VDISPLAY = VirtualDisplay()
 
 # ------------------------------------------------------------- noVNC local ---
 
-NOVNC_VERSION = "1.6.0"
+NOVNC_VERSION = "1.7.0"
 NOVNC_URL = f"https://github.com/novnc/noVNC/archive/refs/tags/v{NOVNC_VERSION}.tar.gz"
 NOVNC_DIR = os.path.join(CONF_DIR, "novnc")
+NOVNC_VER_FILE = os.path.join(NOVNC_DIR, ".version")
 NOVNC_KEEP_DIRS = {"core", "vendor", "app"}
 NOVNC_KEEP_FILES = {"vnc.html", "vnc_lite.html", "package.json", "LICENSE.txt",
                     "AUTHORS", "README.md"}
@@ -453,11 +461,22 @@ def mime_of(path):
     return MIME_MAP.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
 
 
+def novnc_cached_version():
+    try:
+        with open(NOVNC_VER_FILE, encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
 def novnc_ready():
     rfb = os.path.join(NOVNC_DIR, "core", "rfb.js")
     if not os.path.isfile(rfb) or os.path.getsize(rfb) < 1000:
         return False
-    return os.path.isfile(os.path.join(NOVNC_DIR, "vnc.html"))
+    if not os.path.isfile(os.path.join(NOVNC_DIR, "vnc.html")):
+        return False
+    # Bắt buộc version khớp — đổi NOVNC_VERSION sẽ tự tải lại bản mới
+    return novnc_cached_version() == NOVNC_VERSION
 
 
 def pick_viewer():
@@ -470,6 +489,9 @@ def pick_viewer():
 def ensure_novnc():
     if novnc_ready():
         return True
+    cached = novnc_cached_version()
+    if cached and cached != NOVNC_VERSION:
+        print(f"♻️  noVNC đang là v{cached} → nâng lên v{NOVNC_VERSION}")
     print(f"📥 Đang tải noVNC v{NOVNC_VERSION} từ GitHub (chỉ 1 lần)…")
     os.makedirs(CONF_DIR, exist_ok=True)
     try:
@@ -512,6 +534,12 @@ def ensure_novnc():
         except OSError:
             shutil.copytree(src, NOVNC_DIR)
             shutil.rmtree(tmp)
+        # Ghi version marker để novnc_ready() nhận đúng bản
+        try:
+            with open(NOVNC_VER_FILE, "w", encoding="utf-8") as f:
+                f.write(NOVNC_VERSION)
+        except OSError:
+            pass
         size = os.path.getsize(os.path.join(NOVNC_DIR, "core", "rfb.js"))
         print(f"✅ noVNC v{NOVNC_VERSION} OK (rfb.js={size:,}B, viewer={pick_viewer()})")
         return True
@@ -982,6 +1010,8 @@ async def handle(r, w):
         if url.path == "/vnc/novnc-check" and method == "GET":
             rfb = os.path.join(NOVNC_DIR, "core", "rfb.js")
             info = {
+                "expected_version": NOVNC_VERSION,
+                "cached_version": novnc_cached_version(),
                 "novnc_dir": NOVNC_DIR,
                 "dir_exists": os.path.isdir(NOVNC_DIR),
                 "novnc_ready": novnc_ready(),
@@ -2417,7 +2447,8 @@ async def amain():
     if CFG["vnc"]["enabled"]:
         if vnc_binary_available():
             ensure_novnc()
-            print(f"🖥️  Màn hình ảo (Xvfb {CFG['vnc']['geometry']}, WM {CFG['vnc']['wm']}, viewer={pick_viewer()})")
+            print(f"🖥️  Màn hình ảo (Xvfb {CFG['vnc']['geometry']}, WM {CFG['vnc']['wm']}, "
+                  f"noVNC v{NOVNC_VERSION}, viewer={pick_viewer()})")
         else:
             print("ℹ️  Không có Xvfb — bỏ qua màn hình ảo (chỉ dùng terminal).")
     print("   (Ctrl+C để dừng)")
